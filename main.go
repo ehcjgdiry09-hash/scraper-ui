@@ -3,6 +3,7 @@ package main
 import (
         "bufio"
         "bytes"
+        "context"
         "crypto/hmac"
         "crypto/sha256"
         "encoding/hex"
@@ -12,9 +13,7 @@ import (
         "log"
         "net/http"
         "os"
-        "path/filepath"
         "regexp"
-        "sort"
         "strconv"
         "strings"
         "sync"
@@ -24,6 +23,9 @@ import (
         tea "github.com/charmbracelet/bubbletea"
         "github.com/charmbracelet/lipgloss"
         "github.com/gorilla/websocket"
+        "go.mongodb.org/mongo-driver/v2/bson"
+        "go.mongodb.org/mongo-driver/v2/mongo"
+        "go.mongodb.org/mongo-driver/v2/mongo/options"
 )
 
 // ─── Dashboard State (thread-safe, shared by workers + HTTP server) ─────────
@@ -238,103 +240,90 @@ func (c *WSClient) readPump() {
         }
 }
 
-// ─── Key Store (JSON file persistence) ────────────────────────────────────
+// ─── Key Store (MongoDB persistence) ─────────────────────────────────────
 
 type KeyEntry struct {
-        ID          int       `json:"id"`
-        Provider    string    `json:"provider"`
-        KeyValue    string    `json:"key"`
-        Status      string    `json:"status"` // "valid", "invalid", "unchecked"
-        Balance     string    `json:"balance"`
-        BalanceNum  float64   `json:"balanceNum"` // numeric for sorting
-        Quota       string    `json:"quota"`
-        Tier        string    `json:"tier"`
-        KeyType     string    `json:"keyType"`
-        Org         string    `json:"org"`
-        Models      string    `json:"models"`
-        Details     string    `json:"details"`
-        Repo        string    `json:"repo"`
-        CommitUrl   string    `json:"commitUrl"`
-        LastChecked time.Time `json:"lastChecked"`
-        LastUsed    time.Time `json:"lastUsed"`
-        UseCount    int       `json:"useCount"`
-        FoundAt     time.Time `json:"foundAt"`
+        ID          int       `json:"id" bson:"id"`
+        Provider    string    `json:"provider" bson:"provider"`
+        KeyValue    string    `json:"key" bson:"key"`
+        Status      string    `json:"status" bson:"status"` // "valid", "unchecked"
+        Balance     string    `json:"balance" bson:"balance"`
+        BalanceNum  float64   `json:"balanceNum" bson:"balanceNum"` // numeric for sorting
+        Quota       string    `json:"quota" bson:"quota"`
+        Tier        string    `json:"tier" bson:"tier"`
+        KeyType     string    `json:"keyType" bson:"keyType"`
+        Org         string    `json:"org" bson:"org"`
+        Models      string    `json:"models" bson:"models"`
+        Details     string    `json:"details" bson:"details"`
+        Repo        string    `json:"repo" bson:"repo"`
+        CommitUrl   string    `json:"commitUrl" bson:"commitUrl"`
+        LastChecked time.Time `json:"lastChecked" bson:"lastChecked"`
+        LastUsed    time.Time `json:"lastUsed" bson:"lastUsed"`
+        UseCount    int       `json:"useCount" bson:"useCount"`
+        FoundAt     time.Time `json:"foundAt" bson:"foundAt"`
 }
 
 type KeyStore struct {
         mu       sync.RWMutex
-        Keys     []KeyEntry `json:"keys"`
-        NextID   int        `json:"nextId"`
-        filePath string
-        dirty    bool
+        coll     *mongo.Collection
+        nextID   atomic.Int64
 }
 
 var keyStore *KeyStore
 
-func NewKeyStore(path string) *KeyStore {
-        ks := &KeyStore{
-                filePath: path,
-                Keys:     make([]KeyEntry, 0),
-                NextID:   1,
-        }
-        // Try to load from file
-        data, err := os.ReadFile(path)
-        if err == nil {
-                json.Unmarshal(data, ks)
-        }
-        if ks.Keys == nil {
-                ks.Keys = make([]KeyEntry, 0)
-        }
-        return ks
-}
+func NewKeyStore(mongoURI string) *KeyStore {
+        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+        defer cancel()
 
-func (ks *KeyStore) Save() {
-        ks.mu.RLock()
-        data, err := json.MarshalIndent(ks, "", "  ")
-        filePath := ks.filePath
-        ks.mu.RUnlock()
+        client, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
         if err != nil {
-                log.Printf("KeyStore marshal error: %v", err)
-                return
+                log.Fatalf("MongoDB connect error: %v", err)
         }
-        // Ensure directory exists
-        dir := filepath.Dir(filePath)
-        os.MkdirAll(dir, 0755)
-        if err := os.WriteFile(filePath, data, 0644); err != nil {
-                log.Printf("KeyStore write error: %v", err)
+        if err := client.Ping(ctx, nil); err != nil {
+                log.Fatalf("MongoDB ping error: %v", err)
         }
-}
+        log.Println("Connected to MongoDB!")
 
-func (ks *KeyStore) AutoSave() {
-        ticker := time.NewTicker(30 * time.Second)
-        for range ticker.C {
-                ks.mu.RLock()
-                dirty := ks.dirty
-                ks.mu.RUnlock()
-                if dirty {
-                        ks.Save()
-                        ks.mu.Lock()
-                        ks.dirty = false
-                        ks.mu.Unlock()
-                }
-        }
-}
+        coll := client.Database("keypool").Collection("keys")
 
-func (ks *KeyStore) markDirty() {
-        ks.dirty = true
+        // Create unique index on key field
+        coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+                Keys: bson.D{{Key: "key", Value: 1}},
+                Options: options.Index().SetUnique(true),
+        })
+
+        // Create index on provider + status
+        coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+                Keys: bson.D{{Key: "provider", Value: 1}, {Key: "status", Value: 1}},
+        })
+
+        // Find max ID to continue sequence
+        var maxEntry KeyEntry
+        opts := options.FindOne().SetSort(bson.D{{Key: "id", Value: -1}})
+        err = coll.FindOne(context.Background(), bson.D{}, opts).Decode(&maxEntry)
+        ks := &KeyStore{coll: coll}
+        if err == nil {
+                ks.nextID.Store(int64(maxEntry.ID + 1))
+        } else {
+                ks.nextID.Store(1)
+        }
+
+        return ks
 }
 
 func (ks *KeyStore) AddKey(provider, key, repo, commitUrl string) *KeyEntry {
         ks.mu.Lock()
         defer ks.mu.Unlock()
-        // Check for duplicate by key value
-        for i := range ks.Keys {
-                if ks.Keys[i].KeyValue == key {
-                        return &ks.Keys[i]
-                }
+
+        // Check for duplicate
+        var existing KeyEntry
+        err := ks.coll.FindOne(context.Background(), bson.D{{Key: "key", Value: key}}).Decode(&existing)
+        if err == nil {
+                return &existing
         }
+
         entry := KeyEntry{
-                ID:        ks.NextID,
+                ID:        int(ks.nextID.Add(1) - 1),
                 Provider:  provider,
                 KeyValue:  key,
                 Status:    "unchecked",
@@ -342,56 +331,67 @@ func (ks *KeyStore) AddKey(provider, key, repo, commitUrl string) *KeyEntry {
                 CommitUrl: commitUrl,
                 FoundAt:   time.Now(),
         }
-        ks.NextID++
-        ks.Keys = append(ks.Keys, entry)
-        ks.markDirty()
-        return &ks.Keys[len(ks.Keys)-1]
+
+        _, err = ks.coll.InsertOne(context.Background(), entry)
+        if err != nil {
+                log.Printf("MongoDB insert error: %v", err)
+                return nil
+        }
+        return &entry
+}
+
+func parseBalanceNum(balance string) float64 {
+        balanceNum := 0.0
+        if balance != "" {
+                balStr := strings.TrimPrefix(balance, "$")
+                parts := strings.Fields(balStr)
+                if len(parts) > 0 {
+                        fmt.Sscanf(parts[0], "%f", &balanceNum)
+                }
+        }
+        return balanceNum
 }
 
 func (ks *KeyStore) UpdateKey(id int, status, balance, quota, tier, keyType, org, models, details string) {
         ks.mu.Lock()
         defer ks.mu.Unlock()
-        for i := range ks.Keys {
-                if ks.Keys[i].ID == id {
-                        ks.Keys[i].Status = status
-                        ks.Keys[i].Balance = balance
-                        ks.Keys[i].Quota = quota
-                        ks.Keys[i].Tier = tier
-                        ks.Keys[i].KeyType = keyType
-                        ks.Keys[i].Org = org
-                        ks.Keys[i].Models = models
-                        ks.Keys[i].Details = details
-                        ks.Keys[i].LastChecked = time.Now()
-                        // Parse balance number for sorting
-                        balanceNum := 0.0
-                        if balance != "" {
-                                // Try to extract a dollar amount
-                                balStr := strings.TrimPrefix(balance, "$")
-                                parts := strings.Fields(balStr)
-                                if len(parts) > 0 {
-                                        fmt.Sscanf(parts[0], "%f", &balanceNum)
-                                }
-                        }
-                        ks.Keys[i].BalanceNum = balanceNum
-                        ks.markDirty()
-                        return
-                }
+
+        update := bson.D{
+                {Key: "$set", Value: bson.D{
+                        {Key: "status", Value: status},
+                        {Key: "balance", Value: balance},
+                        {Key: "quota", Value: quota},
+                        {Key: "tier", Value: tier},
+                        {Key: "keyType", Value: keyType},
+                        {Key: "org", Value: org},
+                        {Key: "models", Value: models},
+                        {Key: "details", Value: details},
+                        {Key: "lastChecked", Value: time.Now()},
+                        {Key: "balanceNum", Value: parseBalanceNum(balance)},
+                }},
+        }
+        _, err := ks.coll.UpdateOne(context.Background(), bson.D{{Key: "id", Value: id}}, update)
+        if err != nil {
+                log.Printf("MongoDB update error: %v", err)
         }
 }
 
 func (ks *KeyStore) GetValidKeys(provider string) []KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        var result []KeyEntry
-        for _, k := range ks.Keys {
-                if k.Status == "valid" && (provider == "" || k.Provider == provider) {
-                        result = append(result, k)
-                }
+
+        filter := bson.D{{Key: "status", Value: "valid"}}
+        if provider != "" {
+                filter = append(filter, bson.E{Key: "provider", Value: provider})
         }
-        // Sort by BalanceNum descending
-        sort.Slice(result, func(i, j int) bool {
-                return result[i].BalanceNum > result[j].BalanceNum
-        })
+        opts := options.Find().SetSort(bson.D{{Key: "balanceNum", Value: -1}})
+        cursor, err := ks.coll.Find(context.Background(), filter, opts)
+        if err != nil {
+                log.Printf("MongoDB find error: %v", err)
+                return nil
+        }
+        var result []KeyEntry
+        cursor.All(context.Background(), &result)
         return result
 }
 
@@ -406,62 +406,52 @@ func (ks *KeyStore) GetBestKey(provider string) *KeyEntry {
 func (ks *KeyStore) MarkUsed(id int) {
         ks.mu.Lock()
         defer ks.mu.Unlock()
-        for i := range ks.Keys {
-                if ks.Keys[i].ID == id {
-                        ks.Keys[i].UseCount++
-                        ks.Keys[i].LastUsed = time.Now()
-                        ks.markDirty()
-                        return
-                }
-        }
-}
 
-func (ks *KeyStore) MarkInvalid(id int) {
-        ks.mu.Lock()
-        defer ks.mu.Unlock()
-        for i := range ks.Keys {
-                if ks.Keys[i].ID == id {
-                        ks.Keys[i].Status = "invalid"
-                        ks.Keys[i].LastChecked = time.Now()
-                        ks.markDirty()
-                        return
-                }
+        update := bson.D{
+                {Key: "$inc", Value: bson.D{{Key: "useCount", Value: 1}}},
+                {Key: "$set", Value: bson.D{{Key: "lastUsed", Value: time.Now()}}},
         }
+        ks.coll.UpdateOne(context.Background(), bson.D{{Key: "id", Value: id}}, update)
 }
 
 func (ks *KeyStore) GetStats() map[string]interface{} {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        total := len(ks.Keys)
-        valid := 0
-        invalid := 0
-        unchecked := 0
-        providerCounts := make(map[string]map[string]int) // provider -> {total, valid, invalid}
-        for _, k := range ks.Keys {
-                switch k.Status {
-                case "valid":
-                        valid++
-                case "invalid":
-                        invalid++
-                default:
-                        unchecked++
-                }
-                if _, ok := providerCounts[k.Provider]; !ok {
-                        providerCounts[k.Provider] = map[string]int{"total": 0, "valid": 0, "invalid": 0}
-                }
-                providerCounts[k.Provider]["total"]++
-                if k.Status == "valid" {
-                        providerCounts[k.Provider]["valid"]++
-                }
-                if k.Status == "invalid" {
-                        providerCounts[k.Provider]["invalid"]++
-                }
+
+        ctx := context.Background()
+        total, _ := ks.coll.CountDocuments(ctx, bson.D{})
+        valid, _ := ks.coll.CountDocuments(ctx, bson.D{{Key: "status", Value: "valid"}})
+        unchecked, _ := ks.coll.CountDocuments(ctx, bson.D{{Key: "status", Value: "unchecked"}})
+
+        // Get provider counts via aggregation
+        pipeline := []bson.D{
+                {{Key: "$group", Value: bson.D{
+                        {Key: "_id", Value: "$provider"},
+                        {Key: "total", Value: bson.D{{Key: "$sum", Value: 1}}},
+                        {Key: "valid", Value: bson.D{{Key: "$sum", Value: bson.D{{Key: "$cond", Value: bson.D{{Key: "if", Value: bson.D{{Key: "$eq", Value: []string{"$status", "valid"}}}}, {Key: "then", Value: 1}, {Key: "else", Value: 0}}}}}}},
+                }}},
         }
+        cursor, err := ks.coll.Aggregate(ctx, pipeline)
+        if err != nil {
+                return map[string]interface{}{"total": total, "valid": valid, "invalid": 0, "unchecked": unchecked, "providers": map[string]map[string]int{}}
+        }
+        var results []struct {
+                Provider string `bson:"_id"`
+                Total    int    `bson:"total"`
+                Valid    int    `bson:"valid"`
+        }
+        cursor.All(ctx, &results)
+
+        providerCounts := make(map[string]map[string]int)
+        for _, r := range results {
+                providerCounts[r.Provider] = map[string]int{"total": r.Total, "valid": r.Valid, "invalid": r.Total - r.Valid}
+        }
+
         return map[string]interface{}{
-                "total":     total,
-                "valid":     valid,
-                "invalid":   invalid,
-                "unchecked": unchecked,
+                "total":     int(total),
+                "valid":     int(valid),
+                "invalid":   0,
+                "unchecked": int(unchecked),
                 "providers": providerCounts,
         }
 }
@@ -469,62 +459,83 @@ func (ks *KeyStore) GetStats() map[string]interface{} {
 func (ks *KeyStore) GetProviderKeys(provider string) []KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        var result []KeyEntry
-        for _, k := range ks.Keys {
-                if k.Provider == provider {
-                        result = append(result, k)
-                }
+
+        cursor, err := ks.coll.Find(context.Background(), bson.D{{Key: "provider", Value: provider}})
+        if err != nil {
+                return nil
         }
+        var result []KeyEntry
+        cursor.All(context.Background(), &result)
         return result
 }
 
 func (ks *KeyStore) GetAllProviders() []string {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        seen := make(map[string]bool)
-        var result []string
-        for _, k := range ks.Keys {
-                if !seen[k.Provider] {
-                        seen[k.Provider] = true
-                        result = append(result, k.Provider)
-                }
+
+        pipeline := []bson.D{
+                {{Key: "$group", Value: bson.D{{Key: "_id", Value: "$provider"}}}},
+                {{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
         }
-        sort.Strings(result)
-        return result
+        cursor, err := ks.coll.Aggregate(context.Background(), pipeline)
+        if err != nil {
+                return nil
+        }
+        var results []struct {
+                Provider string `bson:"_id"`
+        }
+        cursor.All(context.Background(), &results)
+        var providers []string
+        for _, r := range results {
+                providers = append(providers, r.Provider)
+        }
+        return providers
 }
 
 func (ks *KeyStore) DeleteKey(id int) {
         ks.mu.Lock()
         defer ks.mu.Unlock()
-        for i, k := range ks.Keys {
-                if k.ID == id {
-                        ks.Keys = append(ks.Keys[:i], ks.Keys[i+1:]...)
-                        ks.markDirty()
-                        return
-                }
+        _, err := ks.coll.DeleteOne(context.Background(), bson.D{{Key: "id", Value: id}})
+        if err != nil {
+                log.Printf("MongoDB delete error: %v", err)
         }
 }
 
 func (ks *KeyStore) GetKeyByID(id int) *KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        for i := range ks.Keys {
-                if ks.Keys[i].ID == id {
-                        return &ks.Keys[i]
-                }
+
+        var entry KeyEntry
+        err := ks.coll.FindOne(context.Background(), bson.D{{Key: "id", Value: id}}).Decode(&entry)
+        if err != nil {
+                return nil
         }
-        return nil
+        return &entry
 }
 
 func (ks *KeyStore) GetKeyByValue(key string) *KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
-        for i := range ks.Keys {
-                if ks.Keys[i].KeyValue == key {
-                        return &ks.Keys[i]
-                }
+
+        var entry KeyEntry
+        err := ks.coll.FindOne(context.Background(), bson.D{{Key: "key", Value: key}}).Decode(&entry)
+        if err != nil {
+                return nil
         }
-        return nil
+        return &entry
+}
+
+func (ks *KeyStore) GetAllKeys() []KeyEntry {
+        ks.mu.RLock()
+        defer ks.mu.RUnlock()
+
+        cursor, err := ks.coll.Find(context.Background(), bson.D{})
+        if err != nil {
+                return nil
+        }
+        var result []KeyEntry
+        cursor.All(context.Background(), &result)
+        return result
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -540,6 +551,7 @@ type Config struct {
         ProxyEnabled      bool
         AutoValidate      bool
         ValidateInterval  string
+        MongoDBURI        string
 }
 
 // ─── App Settings ──────────────────────────────────────────────────────────
@@ -922,6 +934,7 @@ func initConfig(cfg *Config) error {
         cfg.ProxyEnabled = getEnvBool("PROXY_ENABLED", true)
         cfg.AutoValidate = getEnvBool("AUTO_VALIDATE", true)
         cfg.ValidateInterval = getEnv("VALIDATE_INTERVAL", "24h")
+        cfg.MongoDBURI = getEnv("MONGODB_URI", "")
         cfg.Signatures = nil // No custom signatures via env
 
         log.Println("Loaded config:")
@@ -932,6 +945,7 @@ func initConfig(cfg *Config) error {
         log.Printf("  Proxy Enabled: %v", cfg.ProxyEnabled)
         log.Printf("  Auto Validate: %v", cfg.AutoValidate)
         log.Printf("  Validate Interval: %s", cfg.ValidateInterval)
+        log.Printf("  MongoDB: %v", cfg.MongoDBURI != "")
         return nil
 }
 
@@ -2140,8 +2154,10 @@ func main() {
         }
 
         // ── Initialize Key Store ──
-        keyStore = NewKeyStore("data/keys.json")
-        go keyStore.AutoSave()
+        if cfg.MongoDBURI == "" {
+                log.Fatal("MONGODB_URI is required")
+        }
+        keyStore = NewKeyStore(cfg.MongoDBURI)
 
         // ── Initialize Settings ──
         appSettings = defaultSettings(cfg)
@@ -2943,7 +2959,6 @@ func validateAllKeys(cfg Config) {
                 }
         }
         log.Println("[cron] Re-validation complete")
-        keyStore.Save()
 }
 
 func validateSingleKey(id int, cfg Config) {
@@ -2971,7 +2986,6 @@ func validateSingleKey(id int, cfg Config) {
                         })
                 }
         }
-        keyStore.Save()
 }
 
 // ─── Dashboard Auth ────────────────────────────────────────────────────────
@@ -3080,10 +3094,7 @@ func handleGetKeys(w http.ResponseWriter, r *http.Request) {
         if provider != "" {
                 keys = keyStore.GetProviderKeys(provider)
         } else {
-                keyStore.mu.RLock()
-                keys = make([]KeyEntry, len(keyStore.Keys))
-                copy(keys, keyStore.Keys)
-                keyStore.mu.RUnlock()
+                keys = keyStore.GetAllKeys()
         }
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(keys)
@@ -3113,7 +3124,6 @@ func handleDeleteKey(w http.ResponseWriter, r *http.Request) {
                 return
         }
         keyStore.DeleteKey(id)
-        keyStore.Save()
         w.WriteHeader(http.StatusNoContent)
 }
 
@@ -3150,7 +3160,6 @@ func handleAddKey(w http.ResponseWriter, r *http.Request) {
 
         // Add key as unchecked, then verify in background
         entry := keyStore.AddKey(req.Provider, req.Key, "manual", "")
-        keyStore.Save()
 
         w.Header().Set("Content-Type", "application/json")
         json.NewEncoder(w).Encode(entry)
