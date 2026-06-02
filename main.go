@@ -14,6 +14,7 @@ import (
         "net/http"
         "os"
         "regexp"
+        "sort"
         "strconv"
         "strings"
         "sync"
@@ -527,7 +528,8 @@ func (ks *KeyStore) GetProviderKeys(provider string) []KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
 
-        cursor, err := ks.coll.Find(context.Background(), bson.D{{Key: "provider", Value: provider}})
+        opts := options.Find().SetSort(bson.D{{Key: "balanceNum", Value: -1}})
+        cursor, err := ks.coll.Find(context.Background(), bson.D{{Key: "provider", Value: provider}}, opts)
         if err != nil {
                 return nil
         }
@@ -542,7 +544,6 @@ func (ks *KeyStore) GetAllProviders() []string {
 
         pipeline := []bson.D{
                 {{Key: "$group", Value: bson.D{{Key: "_id", Value: "$provider"}}}},
-                {{Key: "$sort", Value: bson.D{{Key: "_id", Value: 1}}}},
         }
         cursor, err := ks.coll.Aggregate(context.Background(), pipeline)
         if err != nil {
@@ -556,6 +557,18 @@ func (ks *KeyStore) GetAllProviders() []string {
         for _, r := range results {
                 providers = append(providers, r.Provider)
         }
+        // Sort providers by priority
+        sort.Slice(providers, func(i, j int) bool {
+                pi, oki := providerPriority[providers[i]]
+                pj, okj := providerPriority[providers[j]]
+                if !oki {
+                        pi = 999
+                }
+                if !okj {
+                        pj = 999
+                }
+                return pi < pj
+        })
         return providers
 }
 
@@ -596,13 +609,58 @@ func (ks *KeyStore) GetAllKeys() []KeyEntry {
         ks.mu.RLock()
         defer ks.mu.RUnlock()
 
-        cursor, err := ks.coll.Find(context.Background(), bson.D{})
+        opts := options.Find().SetSort(bson.D{
+                {Key: "provider", Value: 1},
+                {Key: "balanceNum", Value: -1},
+        })
+        cursor, err := ks.coll.Find(context.Background(), bson.D{}, opts)
         if err != nil {
                 return nil
         }
         var result []KeyEntry
         cursor.All(context.Background(), &result)
+
+        // Sort by provider priority: openai first, anthropic second, then alphabetical
+        result = sortKeysByPriority(result)
         return result
+}
+
+// providerPriority defines the display order for providers
+var providerPriority = map[string]int{
+        "openai":      1,
+        "anthropic":   2,
+        "deepseek":    3,
+        "groq":        4,
+        "mistral":     5,
+        "openrouter":  6,
+        "xai":         7,
+        "together":    8,
+        "fireworks":   9,
+        "perplexity":  10,
+        "huggingface": 11,
+        "replicate":   12,
+        "cohere":      13,
+        "elevenlabs":  14,
+        "ai21":        15,
+}
+
+func sortKeysByPriority(keys []KeyEntry) []KeyEntry {
+        sort.Slice(keys, func(i, j int) bool {
+                pi, oki := providerPriority[keys[i].Provider]
+                pj, okj := providerPriority[keys[j].Provider]
+                if !oki {
+                        pi = 999
+                }
+                if !okj {
+                        pj = 999
+                }
+                if pi != pj {
+                        return pi < pj
+                }
+                // Same provider: sort by balance descending
+                return keys[i].BalanceNum > keys[j].BalanceNum
+        })
+        return keys
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -1626,13 +1684,48 @@ func verifyGroq(client *http.Client, key string) VerifyResult {
         result := VerifyResult{Valid: true, Details: "valid"}
         var data map[string]interface{}
         json.Unmarshal(respBytes, &data)
+        modelCount := 0
         if models, ok := data["data"].([]interface{}); ok {
-                result.Details = fmt.Sprintf("valid / %d models", len(models))
+                modelCount = len(models)
+                result.Models = fmt.Sprintf("%d models", modelCount)
+                result.Details = fmt.Sprintf("valid / %d models", modelCount)
         }
-        // Check rate limit headers
-        if rl := resp.Header.Get("X-Ratelimit-Limit-Requests"); rl != "" {
-                result.Quota = rl + " RPM"
+
+        // Detect free trial vs paid via rate limit headers
+        // Groq free tier: 30 RPM, 14400 RPD; paid/dev: much higher limits
+        rlRequests := resp.Header.Get("X-Ratelimit-Limit-Requests")
+        rlTokens := resp.Header.Get("X-Ratelimit-Limit-Tokens")
+        rpdRequests := resp.Header.Get("X-Ratelimit-Limit-Requests-Per-Day")
+
+        if rlRequests != "" {
+                result.Quota = rlRequests + " RPM"
         }
+        if rpdRequests != "" {
+                if result.Quota != "" {
+                        result.Quota += " / " + rpdRequests + " RPD"
+                } else {
+                        result.Quota = rpdRequests + " RPD"
+                }
+        }
+
+        // Determine tier based on rate limits
+        // Free trial: 30 RPM, 14400 RPD; Developer (paid): 30 RPM but higher token limits
+        // Dev tier has X-Ratelimit-Limit-Tokens per day > 1M
+        result.Tier = "Free Trial"
+        if rlTokens != "" {
+                if tokenLimit, err := strconv.ParseInt(rlTokens, 10, 64); err == nil && tokenLimit > 15000 {
+                        result.Tier = "Developer (Paid)"
+                }
+        }
+        // Also check per-day token limit
+        rpdTokens := resp.Header.Get("X-Ratelimit-Limit-Tokens-Per-Day")
+        if rpdTokens != "" {
+                if tokenLimit, err := strconv.ParseInt(rpdTokens, 10, 64); err == nil && tokenLimit > 1000000 {
+                        result.Tier = "Developer (Paid)"
+                }
+        }
+        result.KeyType = result.Tier
+
         return result
 }
 

@@ -390,6 +390,7 @@ function doLogout() {
 function showApp() {
   document.getElementById('loginView').classList.remove('active');
   document.getElementById('appView').classList.add('active');
+  loadActivityFromStorage();
   loadAll();
   connectWS();
 }
@@ -867,9 +868,27 @@ function handleWSMessage(msg) {
 var activityItems = [];
 var MAX_ACTIVITY = 50;
 
+function saveActivityToStorage() {
+  try {
+    localStorage.setItem('kp_activity', JSON.stringify(activityItems));
+  } catch(e) {}
+}
+
+function loadActivityFromStorage() {
+  try {
+    var stored = localStorage.getItem('kp_activity');
+    if (stored) {
+      activityItems = JSON.parse(stored);
+      if (activityItems.length > MAX_ACTIVITY) activityItems = activityItems.slice(0, MAX_ACTIVITY);
+      renderActivityFeed();
+    }
+  } catch(e) {}
+}
+
 function addActivityItem(provider, status, data) {
   activityItems.unshift({provider: provider, status: status, data: data, time: Date.now()});
   if (activityItems.length > MAX_ACTIVITY) activityItems = activityItems.slice(0, MAX_ACTIVITY);
+  saveActivityToStorage();
   renderActivityFeed();
 }
 
