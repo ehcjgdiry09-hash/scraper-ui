@@ -271,31 +271,98 @@ type KeyStore struct {
 
 var keyStore *KeyStore
 
-func NewKeyStore(mongoURI string) *KeyStore {
-        ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-        defer cancel()
+// normalizeMongoURI ensures the connection string has required parameters
+func normalizeMongoURI(uri string) string {
+        // Add tls=true if not present (required for Atlas)
+        if !strings.Contains(uri, "tls=") && !strings.Contains(uri, "ssl=") {
+                if strings.Contains(uri, "?") {
+                        uri += "&tls=true"
+                } else {
+                        uri += "?tls=true"
+                }
+        }
+        // Add authSource=admin if not present (required for Atlas)
+        if !strings.Contains(uri, "authSource=") {
+                uri += "&authSource=admin"
+        }
+        // Add retryWrites if not present
+        if !strings.Contains(uri, "retryWrites=") {
+                uri += "&retryWrites=true"
+        }
+        // Add w=majority if not present
+        if !strings.Contains(uri, "w=") {
+                uri += "&w=majority"
+        }
+        return uri
+}
 
-        client, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
-        if err != nil {
-                log.Fatalf("MongoDB connect error: %v", err)
+func NewKeyStore(mongoURI string) *KeyStore {
+        mongoURI = normalizeMongoURI(mongoURI)
+        log.Printf("Connecting to MongoDB (URI normalized)...")
+
+        var client *mongo.Client
+        var err error
+
+        // Retry connection with exponential backoff
+        maxRetries := 5
+        for attempt := 1; attempt <= maxRetries; attempt++ {
+                ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+
+                client, err = mongo.Connect(options.Client().ApplyURI(mongoURI))
+                if err != nil {
+                        cancel()
+                        log.Printf("MongoDB connect error (attempt %d/%d): %v", attempt, maxRetries, err)
+                        if attempt < maxRetries {
+                                time.Sleep(time.Duration(attempt*5) * time.Second)
+                                continue
+                        }
+                        log.Fatalf("MongoDB connect failed after %d attempts. Error: %v\n"+
+                                "HINT: If using MongoDB Atlas, go to Network Access in Atlas Dashboard and add 0.0.0.0/0 to allow all IPs.", maxRetries, err)
+                }
+
+                err = client.Ping(ctx, nil)
+                cancel()
+                if err != nil {
+                        log.Printf("MongoDB ping error (attempt %d/%d): %v", attempt, maxRetries, err)
+                        if attempt < maxRetries {
+                                // Check if it's a TLS error and give specific hint
+                                if strings.Contains(err.Error(), "tls:") {
+                                        log.Printf("TLS error detected - this usually means your MongoDB Atlas Network Access doesn't allow this server's IP.")
+                                        log.Printf("Go to Atlas Dashboard > Network Access > Add IP Address > Add 0.0.0.0/0 (Allow All)")
+                                }
+                                time.Sleep(time.Duration(attempt*5) * time.Second)
+                                // Disconnect and try fresh
+                                client.Disconnect(context.Background())
+                                continue
+                        }
+                        log.Fatalf("MongoDB ping failed after %d attempts. Error: %v\n"+
+                                "HINT: If using MongoDB Atlas, go to Network Access in Atlas Dashboard and add 0.0.0.0/0 to allow all IPs.", maxRetries, err)
+                }
+
+                // Success!
+                break
         }
-        if err := client.Ping(ctx, nil); err != nil {
-                log.Fatalf("MongoDB ping error: %v", err)
-        }
+
         log.Println("Connected to MongoDB!")
 
         coll := client.Database("keypool").Collection("keys")
 
         // Create unique index on key field
-        coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+        _, idxErr := coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
                 Keys: bson.D{{Key: "key", Value: 1}},
                 Options: options.Index().SetUnique(true),
         })
+        if idxErr != nil {
+                log.Printf("MongoDB index create warning (key): %v", idxErr)
+        }
 
         // Create index on provider + status
-        coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
+        _, idxErr = coll.Indexes().CreateOne(context.Background(), mongo.IndexModel{
                 Keys: bson.D{{Key: "provider", Value: 1}, {Key: "status", Value: 1}},
         })
+        if idxErr != nil {
+                log.Printf("MongoDB index create warning (provider+status): %v", idxErr)
+        }
 
         // Find max ID to continue sequence
         var maxEntry KeyEntry
