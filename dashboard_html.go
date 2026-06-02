@@ -892,6 +892,12 @@ function addActivityItem(provider, status, data) {
   renderActivityFeed();
 }
 
+function redactKey(key) {
+  if (!key) return '';
+  if (key.length <= 12) return key.substring(0, 4) + '...' + key.substring(key.length - 4);
+  return key.substring(0, 6) + '...' + key.substring(key.length - 4);
+}
+
 function renderActivityFeed() {
   var el = document.getElementById('activityFeed');
   if (activityItems.length === 0) {
@@ -906,10 +912,15 @@ function renderActivityFeed() {
     var label = item.status === 'valid' ? 'Valid' : (item.status === 'invalid' ? 'Invalid' : 'Found');
     var detail = '';
     if (item.data) {
-      if (item.data.Balance) detail = ' | Balance: ' + item.data.Balance;
-      else if (item.data.Details) detail = ' | ' + item.data.Details;
+      if (item.status === 'invalid') {
+        detail = ' ' + escHtml(redactKey(item.data.Key || item.data.key || ''));
+        if (item.data.Details) detail += ' | ' + item.data.Details;
+      } else {
+        if (item.data.Balance) detail = ' | Balance: ' + item.data.Balance;
+        else if (item.data.Details) detail = ' | ' + item.data.Details;
+      }
     }
-    html += '<div class="feed-item"><span class="feed-dot ' + dotCls + '"></span><span>' + label + ' <strong>' + item.provider + '</strong> key' + escHtml(detail) + '</span><span class="feed-time">' + timeAgo(item.time) + '</span></div>';
+    html += '<div class="feed-item"><span class="feed-dot ' + dotCls + '"></span><span>' + label + ' <strong>' + item.provider + '</strong> key' + detail + '</span><span class="feed-time">' + timeAgo(item.time) + '</span></div>';
   }
   el.innerHTML = html;
 }

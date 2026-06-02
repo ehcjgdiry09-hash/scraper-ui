@@ -2419,8 +2419,8 @@ func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan S
         }
         log.Printf("Started %d verification workers", numVerifyWorkers)
 
-        // GitHub Events Poller
-        pollEvents(scanJobs, tokenPool, nil)
+        // GitHub Events Poller (run in goroutine so it doesn't block WS broadcast)
+        go pollEvents(scanJobs, tokenPool, nil)
 
         // Periodic WebSocket broadcast
         go func() {
