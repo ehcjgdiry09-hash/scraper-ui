@@ -430,7 +430,7 @@ function updateStats(d) {
   var ks = d.keyStore || {};
   document.getElementById('stat-total').textContent = ks.total || 0;
   document.getElementById('stat-valid').textContent = ks.valid || 0;
-  document.getElementById('stat-invalid').textContent = ks.invalid || 0;
+  document.getElementById('stat-invalid').textContent = d.totalInvalid || ks.invalid || 0;
   document.getElementById('stat-unchecked').textContent = ks.unchecked || 0;
 
   var rlRemain = d.rateLimitRemain || 0;

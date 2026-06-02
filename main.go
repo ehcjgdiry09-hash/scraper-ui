@@ -2641,15 +2641,13 @@ func headlessVerifyWorker(id int, rawChan <-chan RawMatch, webhook *HeadlessWebh
                         }
                 }
 
-                // Save to KeyStore
-                entry := keyStore.AddKey(raw.Provider, raw.Text, raw.Repo, raw.CommitUrl)
+                // Save to KeyStore — only valid keys
                 if vr.Valid {
+                        entry := keyStore.AddKey(raw.Provider, raw.Text, raw.Repo, raw.CommitUrl)
                         keyStore.UpdateKey(entry.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
-                } else {
-                        keyStore.UpdateKey(entry.ID, "invalid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
                 }
 
-                // Broadcast via WebSocket
+                // Broadcast via WebSocket (both valid + invalid for activity feed)
                 if wsHub != nil {
                         wsHub.Broadcast("newKey", verified)
                 }
