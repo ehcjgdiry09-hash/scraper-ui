@@ -267,6 +267,7 @@ select:focus{border-color:var(--accent)}
 <div class="table-toolbar">
 <div class="search-box"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg><input type="text" id="keySearch" placeholder="Search keys..." oninput="filterKeys()"></div>
 <div class="provider-tabs" id="providerTabs"></div>
+<button class="btn" onclick="showAddKeyModal()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg> Add Key</button>
 <button class="btn btn-accent" onclick="validateAll()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg> Validate All</button>
 </div>
 <div class="table-scroll">
@@ -648,6 +649,34 @@ function validateAll() {
   }).catch(function(){ showToast('Request failed', 'error'); });
 }
 
+/* ── Add Key ── */
+var ADD_KEY_PROVIDERS = ['openai','anthropic','deepseek','mistral','groq','openrouter','xai','together','fireworks','perplexity','huggingface','replicate','cohere','elevenlabs','ai21'];
+
+function showAddKeyModal() {
+  var modal = document.getElementById('confirmModal');
+  var opts = '';
+  for (var i = 0; i < ADD_KEY_PROVIDERS.length; i++) {
+    opts += '<option value="' + ADD_KEY_PROVIDERS[i] + '">' + ADD_KEY_PROVIDERS[i] + '</option>';
+  }
+  modal.style.display = 'block';
+  modal.innerHTML = '<div class="modal-overlay" onclick="closeConfirm()"><div class="modal-box" onclick="event.stopPropagation()" style="text-align:left;width:420px"><h3 style="text-align:center">Add Key</h3><div style="margin-bottom:14px"><label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">Provider</label><select id="addKeyProvider" style="width:100%">' + opts + '</select></div><div style="margin-bottom:14px"><label style="font-size:12px;color:var(--text-dim);display:block;margin-bottom:4px">API Key</label><input type="text" id="addKeyValue" placeholder="sk-..." style="width:100%;padding:10px 14px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg);color:var(--text);font-size:13px;font-family:monospace;outline:none"></div><div style="font-size:12px;color:var(--text-dim);margin-bottom:16px">Key will be auto-verified after adding. If invalid, it will be removed.</div><div class="modal-actions"><button class="btn" onclick="closeConfirm()">Cancel</button><button class="btn btn-accent" onclick="submitAddKey()">Add Key</button></div></div></div>';
+}
+
+function submitAddKey() {
+  var provider = document.getElementById('addKeyProvider').value;
+  var key = document.getElementById('addKeyValue').value.trim();
+  if (!key) { showToast('Please enter a key', 'error'); return; }
+  closeConfirm();
+  fetch('/api/keys', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({provider:provider, key:key})})
+    .then(function(r) {
+      if (r.status === 409) { showToast('Key already exists', 'error'); return null; }
+      if (r.status === 400) { return r.json(); }
+      if (r.ok) { showToast('Key added, verifying...', 'success'); loadKeys(); loadStats(); return null; }
+      showToast('Failed to add key', 'error'); return null;
+    })
+    .catch(function(){ showToast('Request failed', 'error'); });
+}
+
 /* ── Proxy ── */
 var PROXY_ENDPOINTS = {
   openai: ['POST /api/openai/v1/chat/completions', 'GET /api/openai/v1/models', 'POST /api/openai/v1/embeddings', 'POST /api/openai/v1/images/generations'],
@@ -822,6 +851,9 @@ function handleWSMessage(msg) {
   }
 
   if (type === 'keyUpdate') {
+    if (data && data.status === 'deleted') {
+      showToast('Key #' + data.id + ' removed (no longer valid)', 'info');
+    }
     if (S.currentPage === 'keys') loadKeys();
     loadStats();
   }

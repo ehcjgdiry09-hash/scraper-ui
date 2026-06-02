@@ -516,6 +516,17 @@ func (ks *KeyStore) GetKeyByID(id int) *KeyEntry {
         return nil
 }
 
+func (ks *KeyStore) GetKeyByValue(key string) *KeyEntry {
+        ks.mu.RLock()
+        defer ks.mu.RUnlock()
+        for i := range ks.Keys {
+                if ks.Keys[i].KeyValue == key {
+                        return &ks.Keys[i]
+                }
+        }
+        return nil
+}
+
 // ─── Config ──────────────────────────────────────────────────────────────────
 
 type Config struct {
@@ -2834,15 +2845,15 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
                         return
                 }
 
-                // If 401/403, mark key as invalid and try next
+                // If 401/403, delete key and try next
                 if resp.StatusCode == 401 || resp.StatusCode == 403 {
                         resp.Body.Close()
-                        keyStore.MarkInvalid(bestKey.ID)
-                        log.Printf("[proxy] Key %d for %s returned %d, marking invalid", bestKey.ID, provider, resp.StatusCode)
+                        keyStore.DeleteKey(bestKey.ID)
+                        log.Printf("[proxy] Key %d for %s returned %d, deleted", bestKey.ID, provider, resp.StatusCode)
                         if wsHub != nil {
                                 wsHub.Broadcast("keyUpdate", map[string]interface{}{
                                         "id":     bestKey.ID,
-                                        "status": "invalid",
+                                        "status": "deleted",
                                 })
                         }
                         continue
@@ -2911,21 +2922,24 @@ func validateAllKeys(cfg Config) {
 
         for _, k := range keys {
                 vr := verifyKey(k.Provider, k.KeyValue, timeout)
-                newStatus := "valid"
                 if !vr.Valid {
-                        newStatus = "invalid"
-                }
-                keyStore.UpdateKey(k.ID, newStatus, vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
-                if !vr.Valid {
-                        keyStore.MarkInvalid(k.ID)
-                        log.Printf("[cron] Key %d (%s) is now invalid: %s", k.ID, k.Provider, vr.Details)
-                }
-                if wsHub != nil {
-                        wsHub.Broadcast("keyUpdate", map[string]interface{}{
-                                "id":      k.ID,
-                                "status":  newStatus,
-                                "balance": vr.Balance,
-                        })
+                        keyStore.DeleteKey(k.ID)
+                        log.Printf("[cron] Key %d (%s) is now invalid, deleted: %s", k.ID, k.Provider, vr.Details)
+                        if wsHub != nil {
+                                wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                        "id":     k.ID,
+                                        "status": "deleted",
+                                })
+                        }
+                } else {
+                        keyStore.UpdateKey(k.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
+                        if wsHub != nil {
+                                wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                        "id":      k.ID,
+                                        "status":  "valid",
+                                        "balance": vr.Balance,
+                                })
+                        }
                 }
         }
         log.Println("[cron] Re-validation complete")
@@ -2939,20 +2953,23 @@ func validateSingleKey(id int, cfg Config) {
         }
         timeout := time.Duration(cfg.VerifyTimeout) * time.Second
         vr := verifyKey(k.Provider, k.KeyValue, timeout)
-        newStatus := "valid"
         if !vr.Valid {
-                newStatus = "invalid"
-        }
-        keyStore.UpdateKey(k.ID, newStatus, vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
-        if !vr.Valid {
-                keyStore.MarkInvalid(k.ID)
-        }
-        if wsHub != nil {
-                wsHub.Broadcast("keyUpdate", map[string]interface{}{
-                        "id":      k.ID,
-                        "status":  newStatus,
-                        "balance": vr.Balance,
-                })
+                keyStore.DeleteKey(k.ID)
+                if wsHub != nil {
+                        wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                "id":     k.ID,
+                                "status": "deleted",
+                        })
+                }
+        } else {
+                keyStore.UpdateKey(k.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
+                if wsHub != nil {
+                        wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                "id":      k.ID,
+                                "status":  "valid",
+                                "balance": vr.Balance,
+                        })
+                }
         }
         keyStore.Save()
 }
@@ -3098,6 +3115,52 @@ func handleDeleteKey(w http.ResponseWriter, r *http.Request) {
         keyStore.DeleteKey(id)
         keyStore.Save()
         w.WriteHeader(http.StatusNoContent)
+}
+
+type AddKeyRequest struct {
+        Provider string `json:"provider"`
+        Key      string `json:"key"`
+}
+
+func handleAddKey(w http.ResponseWriter, r *http.Request) {
+        var req AddKeyRequest
+        if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+                http.Error(w, "Invalid request body", http.StatusBadRequest)
+                return
+        }
+        req.Provider = strings.ToLower(strings.TrimSpace(req.Provider))
+        req.Key = strings.TrimSpace(req.Key)
+        if req.Provider == "" || req.Key == "" {
+                http.Error(w, "provider and key are required", http.StatusBadRequest)
+                return
+        }
+
+        // Check provider is known
+        if _, ok := providerConfigs[req.Provider]; !ok {
+                http.Error(w, fmt.Sprintf("Unknown provider: %s", req.Provider), http.StatusBadRequest)
+                return
+        }
+
+        // Check for duplicate
+        existing := keyStore.GetKeyByValue(req.Key)
+        if existing != nil {
+                http.Error(w, "Key already exists", http.StatusConflict)
+                return
+        }
+
+        // Add key as unchecked, then verify in background
+        entry := keyStore.AddKey(req.Provider, req.Key, "manual", "")
+        keyStore.Save()
+
+        w.Header().Set("Content-Type", "application/json")
+        json.NewEncoder(w).Encode(entry)
+
+        // Verify in background
+        go func() {
+                var cfg Config
+                cfg.VerifyTimeout = 15
+                validateSingleKey(entry.ID, cfg)
+        }()
 }
 
 func handleRecheckKey(w http.ResponseWriter, r *http.Request) {
@@ -3296,6 +3359,12 @@ func startDashboardServer(port string) {
                                 return
                         }
                         handleGetKeys(w, r)
+                case path == "/api/keys" && r.Method == "POST":
+                        if !checkAuth(r) {
+                                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                                return
+                        }
+                        handleAddKey(w, r)
                 case strings.HasPrefix(path, "/api/keys/") && strings.HasSuffix(path, "/recheck") && r.Method == "POST":
                         if !checkAuth(r) {
                                 http.Error(w, "Unauthorized", http.StatusUnauthorized)
