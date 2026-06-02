@@ -1,0 +1,18 @@
+# Binaries
+scraper-ui
+scanner
+
+# Data
+data/
+*.json
+
+# Environment
+.env
+
+# Logs
+*.log
+scanner.log
+
+# OS
+.DS_Store
+Thumbs.db
