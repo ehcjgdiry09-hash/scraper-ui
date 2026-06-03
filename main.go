@@ -2430,6 +2430,31 @@ func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan S
                 }
         }()
 
+        // Self-ping to keep Render from spinning down (free tier sleeps after 15min inactivity)
+        go func() {
+                selfURL := os.Getenv("RENDER_EXTERNAL_URL")
+                if selfURL == "" {
+                        port := os.Getenv("PORT")
+                        if port == "" {
+                                port = "8080"
+                        }
+                        selfURL = "http://localhost:" + port
+                }
+                healthURL := selfURL + "/health"
+                log.Printf("Self-ping enabled: %s every 10m", healthURL)
+                time.Sleep(30 * time.Second)
+                ticker := time.NewTicker(10 * time.Minute)
+                for range ticker.C {
+                        resp, err := http.Get(healthURL)
+                        if err != nil {
+                                log.Printf("Self-ping failed: %v", err)
+                                continue
+                        }
+                        resp.Body.Close()
+                        log.Printf("Self-ping OK: %s", healthURL)
+                }
+        }()
+
         // Start daily validation cron
         if appSettings.AutoValidate {
                 go startValidationCron(cfg)
@@ -3432,6 +3457,11 @@ func handleValidateAll(w http.ResponseWriter, r *http.Request) {
         json.NewEncoder(w).Encode(map[string]string{"status": "validation started"})
 }
 
+func handleHealth(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.Write([]byte(`{"status":"ok"}`))
+}
+
 func handleWebSocket(w http.ResponseWriter, r *http.Request) {
         conn, err := wsUpgrader.Upgrade(w, r, nil)
         if err != nil {
@@ -3589,6 +3619,9 @@ func startDashboardServer(port string) {
 
         // WebSocket endpoint
         mux.HandleFunc("/ws", handleWebSocket)
+
+        // Health check endpoint (also used for self-ping to keep Render awake)
+        mux.HandleFunc("/health", handleHealth)
 
         // Dashboard pages
         mux.HandleFunc("/", handleDashboard)
