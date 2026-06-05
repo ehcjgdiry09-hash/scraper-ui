@@ -485,6 +485,24 @@ func (ks *KeyStore) GetBestKey(provider string) *KeyEntry {
         return &keys[0]
 }
 
+// GetNextKey returns the best key for a provider, skipping keys with the given IDs (already tried)
+func (ks *KeyStore) GetNextKey(provider string, skipIDs []int) *KeyEntry {
+        keys := ks.GetValidKeys(provider)
+        if len(keys) == 0 {
+                return nil
+        }
+        skipSet := make(map[int]bool, len(skipIDs))
+        for _, id := range skipIDs {
+                skipSet[id] = true
+        }
+        for _, k := range keys {
+                if !skipSet[k.ID] {
+                        return &k
+                }
+        }
+        return nil // all keys exhausted
+}
+
 func (ks *KeyStore) MarkUsed(id int) {
         ks.mu.Lock()
         defer ks.mu.Unlock()
@@ -3394,11 +3412,22 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        // Try up to 3 keys
-        for attempt := 0; attempt < 3; attempt++ {
-                bestKey := keyStore.GetBestKey(provider)
+        // Read request body ONCE upfront (we need to reuse it for retries)
+        bodyBytes, err := io.ReadAll(r.Body)
+        if err != nil {
+                http.Error(w, "Failed to read request body", http.StatusInternalServerError)
+                return
+        }
+        r.Body.Close()
+
+        // Try keys, skipping already-failed ones
+        var triedIDs []int
+        maxAttempts := 5 // try up to 5 different keys
+
+        for attempt := 0; attempt < maxAttempts; attempt++ {
+                bestKey := keyStore.GetNextKey(provider, triedIDs)
                 if bestKey == nil {
-                        http.Error(w, fmt.Sprintf("No valid keys available for %s", provider), http.StatusServiceUnavailable)
+                        http.Error(w, fmt.Sprintf("No valid keys available for %s (tried %d)", provider, len(triedIDs)), http.StatusServiceUnavailable)
                         return
                 }
 
@@ -3416,15 +3445,7 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
                         targetURL += "?" + r.URL.RawQuery
                 }
 
-                // Read request body
-                bodyBytes, err := io.ReadAll(r.Body)
-                if err != nil {
-                        http.Error(w, "Failed to read request body", http.StatusInternalServerError)
-                        return
-                }
-                r.Body.Close()
-
-                // Create outgoing request
+                // Create outgoing request (fresh body each attempt)
                 proxyReq, err := http.NewRequest(r.Method, targetURL, bytes.NewBuffer(bodyBytes))
                 if err != nil {
                         http.Error(w, "Failed to create proxy request", http.StatusInternalServerError)
@@ -3456,28 +3477,54 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
                 client := &http.Client{Timeout: 120 * time.Second}
                 resp, err := client.Do(proxyReq)
                 if err != nil {
-                        http.Error(w, fmt.Sprintf("Proxy request failed: %v", err), http.StatusBadGateway)
-                        return
+                        // Network error — skip this key and try another
+                        log.Printf("[proxy] Request error with key %d for %s: %v", bestKey.ID, provider, err)
+                        triedIDs = append(triedIDs, bestKey.ID)
+                        continue
                 }
 
-                // If 401/403, delete key and try next
+                // If 401/403 — key is dead, delete it and try next
                 if resp.StatusCode == 401 || resp.StatusCode == 403 {
                         resp.Body.Close()
                         keyStore.DeleteKey(bestKey.ID)
                         log.Printf("[proxy] Key %d for %s returned %d, deleted", bestKey.ID, provider, resp.StatusCode)
                         if wsHub != nil {
+                                wsHub.Broadcast("newKey", VerifiedMatch{
+                                        Provider: provider,
+                                        Key:      bestKey.KeyValue,
+                                        Redacted: redactKey(bestKey.KeyValue),
+                                        Valid:    false,
+                                        Details:  fmt.Sprintf("proxy: status %d", resp.StatusCode),
+                                })
                                 wsHub.Broadcast("keyUpdate", map[string]interface{}{
                                         "id":     bestKey.ID,
                                         "status": "deleted",
                                 })
                         }
+                        triedIDs = append(triedIDs, bestKey.ID)
+                        continue
+                }
+
+                // If 429 (rate limit) — key is temporarily limited, skip to next key
+                if resp.StatusCode == 429 {
+                        resp.Body.Close()
+                        log.Printf("[proxy] Key %d for %s rate limited (429), trying next key", bestKey.ID, provider)
+                        triedIDs = append(triedIDs, bestKey.ID)
+                        continue
+                }
+
+                // If 5xx (server error) — provider issue, skip key and try another
+                if resp.StatusCode >= 500 {
+                        resp.Body.Close()
+                        log.Printf("[proxy] Key %d for %s got server error %d, trying next key", bestKey.ID, provider, resp.StatusCode)
+                        triedIDs = append(triedIDs, bestKey.ID)
                         continue
                 }
 
                 // Mark key as used
                 keyStore.MarkUsed(bestKey.ID)
 
-                // Copy response headers
+                // Success (or non-retriable response) — stream it back
                 for key, values := range resp.Header {
                         for _, value := range values {
                                 w.Header().Add(key, value)
@@ -3504,7 +3551,7 @@ func handleAPIProxy(w http.ResponseWriter, r *http.Request) {
                 return
         }
 
-        http.Error(w, "All keys exhausted for "+provider, http.StatusServiceUnavailable)
+        http.Error(w, fmt.Sprintf("All keys exhausted for %s (tried %d)", provider, len(triedIDs)), http.StatusServiceUnavailable)
 }
 
 // ─── Daily Validation Cron ─────────────────────────────────────────────────
