@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: key-scanner
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: GITHUB_TOKEN
+        sync: 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
+      - key: DISCORD_WEBHOOK
+        sync: https://discord.com/api/webhooks/1519692726168190976/FsEME4upxwNZKhOTbDMH-o1ZPH0w4yqalfsBpmVgMOeGhryG6IWaagbV4SnzHCLTbmLI
+      - key: MONGODB_URI
+        sync: mongodb+srv://ehcjgdiry09_db_user:8Z4GvTJmWwnkZcpV@cluster0.9zbutan.mongodb.net/?appName=Cluster0
+      - key: ENABLE_VERIFY
+        value: "true"
+      - key: VERIFY_WORKERS
+        value: "20"
+      - key: VERIFY_TIMEOUT
+        value: "15"
+      - key: RENDER
+        value: "true"
+      - key: PORT
+        value: "10000"
