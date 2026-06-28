@@ -5,7 +5,7 @@ services:
     dockerfilePath: ./Dockerfile
     envVars:
       - key: GITHUB_TOKEN
-        sync: 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
+        sync: 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
       - key: DISCORD_WEBHOOK
         sync: https://discord.com/api/webhooks/1519692726168190976/FsEME4upxwNZKhOTbDMH-o1ZPH0w4yqalfsBpmVgMOeGhryG6IWaagbV4SnzHCLTbmLI
       - key: MONGODB_URI
