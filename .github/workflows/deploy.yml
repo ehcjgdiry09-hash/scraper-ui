@@ -1,22 +1,23 @@
 name: Deploy to Bunny Edge Scripting
 
-# This triggers the deployment every time you push to the 'main' branch.
-# Change 'main' to 'master' if your default branch is named master.
 on:
   push:
     branches:
       - main 
+
+# This is the new section you need to add to fix the error
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
     
     steps:
-      # Step 1: Check out the code from your repository
       - name: Checkout Code
         uses: actions/checkout@v4
 
-      # Step 2: The deployment code from your Bunny.net dashboard
       - name: Deploy Script to Bunny Edge Scripting
         uses: BunnyWay/actions/deploy-script@main
         with:
