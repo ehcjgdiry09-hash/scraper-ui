@@ -7,7 +7,7 @@ services:
       - key: GITHUB_TOKEN
         sync: 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
       - key: DISCORD_WEBHOOK
-        sync: https://discord.com/api/webhooks/1519692726168190976/FsEME4upxwNZKhOTbDMH-o1ZPH0w4yqalfsBpmVgMOeGhryG6IWaagbV4SnzHCLTbmLI
+        sync: https://discord.com/api/webhooks/1520868032988053544/CK7GcmEE28Z8Ex8A9750iIh9TwZ_9kDoXbaK0O8yKj2N30RmNiYIXdlEht2at4TG6fNq
       - key: MONGODB_URI
         sync: mongodb+srv://ehcjgdiry09_db_user:8Z4GvTJmWwnkZcpV@cluster0.9zbutan.mongodb.net/?appName=Cluster0
       - key: ENABLE_VERIFY
